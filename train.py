@@ -7,6 +7,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+import mlflow
+import mlflow.sklearn
+
+mlflow.set_experiment("my-project")
 
 DATA_PATH = "tcga_gdc.csv"
 
@@ -29,13 +33,19 @@ M_STAGE_ORDER = ['M0', 'M1a', 'M1b', 'M1c', 'M1']
 PATH_STAGE_ORDER = ['Stage 0', 'Stage I', 'Stage IA', 'Stage IB', 'Stage II', 'Stage IIA', 'Stage IIB',
                      'Stage IIC', 'Stage III', 'Stage IIIA', 'Stage IIIB', 'Stage IIIC', 'Stage IV', 'I/II NOS']
 
-RANDOM_STATE = 42
-K = 20
+PARAMS = {
+    "k": 10,
+    "variance_threshold": 0.1,
+    "clf_solver": "saga",
+    "clf_class_weight": "balanced",
+    "clf_max_iter": 5000,
+    "random_state":42,
+    "test_size": 0.2,
+}
 
 # Load the clinical+gex corrected dataset
 clinical_gex = pd.read_csv(DATA_PATH, low_memory=False)
 clinical_gex.columns = clinical_gex.columns.str.strip()
-# print(clinical_gex.shape)
 
 gex_cols = [c for c in clinical_gex.columns if c not in CLINICAL_CATEGORICAL_COLS
             + CLINICAL_NUMERIC_COLS + CLINICAL_REMAINING_COLS]
@@ -45,29 +55,8 @@ y = clinical_gex['os_label']
 
 # Split first, so gene selection below only ever sees the training split
 x_train, x_test, y_train, y_test = train_test_split(
-    x, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    x, y, test_size=PARAMS['test_size'], random_state=PARAMS['random_state'], stratify=y
 )
-
-# Select the top-k gex features by ANOVA F-value, fit on the training split only to avoid data leakage
-pre_selection_pipe = Pipeline([
-    ('threshold', VarianceThreshold(threshold=0.1)),
-    ('selectkbest', SelectKBest(f_classif, k=K)),
-])
-pre_selection_pipe.fit(x_train[gex_cols], y_train)
-gex_cols_selected = list(pre_selection_pipe.get_feature_names_out())
-
-features_after_vt = pre_selection_pipe['threshold'].get_feature_names_out()
-f_values = pre_selection_pipe['selectkbest'].scores_
-f_series = pd.Series(f_values, index=features_after_vt).sort_values(ascending=False)
-# print("Top 20 genes by ANOVA F-value:")
-# print(f_series.head(20).to_string())
-
-feature_cols = CLINICAL_CATEGORICAL_COLS + CLINICAL_NUMERIC_COLS + gex_cols_selected
-x_train = x_train[feature_cols]
-x_test = x_test[feature_cols]
-
-# print(f'Dropped {len(CLINICAL_REMAINING_COLS)} clinical cols, {x_train.shape} remaining')
-# print(f"\nTarget distribution:\n{y.value_counts().sort_index()}")
 
 # Build the preprocessing + logistic regression pipeline
 preprocess_features = ColumnTransformer(
@@ -84,15 +73,19 @@ preprocess_features = ColumnTransformer(
         ]), ORDINAL_CATEGORICAL_COLS),
 
         ('numeric', SimpleImputer(strategy='median'), CLINICAL_NUMERIC_COLS),
+        ('gex_selection', Pipeline([
+            ('threshold', VarianceThreshold(threshold=PARAMS['variance_threshold'])),
+            ('selectkbest', SelectKBest(f_classif, k=PARAMS['k'])),
+        ]), gex_cols),
     ],
-    remainder='passthrough',
+    remainder='drop'
 )
 
 lr_clf = LogisticRegression(
-    solver='saga',
-    class_weight='balanced',
-    max_iter=5000,
-    random_state=RANDOM_STATE,
+    solver=PARAMS['clf_solver'],
+    class_weight=PARAMS['clf_class_weight'],
+    max_iter=PARAMS['clf_max_iter'],
+    random_state=PARAMS['random_state'],
 )
 
 full_pipe = Pipeline([
@@ -101,9 +94,26 @@ full_pipe = Pipeline([
     ('clf', lr_clf),
 ])
 
-full_pipe.fit(x_train, y_train)
+with mlflow.start_run():
+    mlflow.log_params(PARAMS)
+    
+    full_pipe.fit(x_train, y_train)
+    predictions = full_pipe.predict(x_test)
+    
+    f1 = metrics.f1_score(y_test, predictions)
+    acc = metrics.accuracy_score(y_test, predictions)
+    
+    print(f'F1 = {f1}\nAcc = {acc}')
+    
+    mlflow.log_metric("f1", f1)
+    mlflow.log_metric("accuracy", acc)
 
-# Evaluate on the validation split
-predictions = full_pipe.predict(x_test)
-print(f"F1: {metrics.f1_score(y_test, predictions)}")
-print(f"Accuracy: {metrics.accuracy_score(y_test, predictions)}")
+    mlflow.sklearn.log_model(
+        full_pipe,
+        name='VT_SKB_LR',
+        input_example=x_train.iloc[:5],
+        skops_trusted_types=["numpy.dtype", "sklearn.feature_selection._univariate_selection.f_classif"],
+    )
+
+    selected_gex = preprocess_features.named_transformers_['gex_selection'].get_feature_names_out()
+    mlflow.log_text("\n".join(selected_gex), "selected_genes.txt")

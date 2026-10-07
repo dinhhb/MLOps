@@ -3,3 +3,5 @@ __pycache__/
 venv/
 tcga_gdc.csv
 .dvc/
+mlruns/
+mlartifacts/
