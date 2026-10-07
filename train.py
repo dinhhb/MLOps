@@ -9,6 +9,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 import mlflow
 import mlflow.sklearn
+import optuna
 
 mlflow.set_experiment("my-project")
 
@@ -36,11 +37,9 @@ PATH_STAGE_ORDER = ['Stage 0', 'Stage I', 'Stage IA', 'Stage IB', 'Stage II', 'S
 PARAMS = {
     "k": 10,
     "variance_threshold": 0.1,
-    "clf_solver": "saga",
-    "clf_class_weight": "balanced",
-    "clf_max_iter": 5000,
     "random_state":42,
     "test_size": 0.2,
+    "optuna_trials": 10
 }
 
 # Load the clinical+gex corrected dataset
@@ -81,39 +80,70 @@ preprocess_features = ColumnTransformer(
     remainder='drop'
 )
 
-lr_clf = LogisticRegression(
-    solver=PARAMS['clf_solver'],
-    class_weight=PARAMS['clf_class_weight'],
-    max_iter=PARAMS['clf_max_iter'],
-    random_state=PARAMS['random_state'],
-)
-
-full_pipe = Pipeline([
+prep = Pipeline([
     ('preprocess', preprocess_features),
     ('scaler', StandardScaler()),
-    ('clf', lr_clf),
 ])
 
-with mlflow.start_run():
+x_train_tf = prep.fit_transform(x_train, y_train)
+x_test_tf = prep.transform(x_test)
+
+def objective(trial):
+    with mlflow.start_run(nested=True, run_name=f'trial_{trial.number}') as child_run:
+        
+        lr_params = {
+            'C':        trial.suggest_float('clf__C', 1e-3, 1.0, log=True),
+            'l1_ratio': trial.suggest_float('clf__l1_ratio', 0.0, 1.0),
+        }
+        
+        clf = LogisticRegression(
+            solver="saga", 
+            class_weight="balanced", 
+            max_iter=5000,
+            random_state=PARAMS['random_state'],
+            C=lr_params['C'],
+            l1_ratio=lr_params['l1_ratio']
+        )
+
+        mlflow.log_params(lr_params)
+        
+        clf.fit(x_train_tf, y_train)
+        predictions = clf.predict(x_test_tf)
+        
+        f1 = metrics.f1_score(y_test, predictions)
+        acc = metrics.accuracy_score(y_test, predictions)
+        
+        print(f'F1 = {f1}\nAcc = {acc}')
+        
+        mlflow.log_metric("f1", f1)
+        mlflow.log_metric("accuracy", acc)
+
+        mlflow.sklearn.log_model(
+            clf,
+            name='VT_SKB_LR',
+            input_example=x_train_tf[:5],
+            skops_trusted_types=["numpy.dtype", "sklearn.feature_selection._univariate_selection.f_classif"],
+        )
+
+        selected_gex = preprocess_features.named_transformers_['gex_selection'].get_feature_names_out()
+        mlflow.log_text("\n".join(selected_gex), "selected_genes.txt")
+        
+        # retrieve best-performing child run later
+        trial.set_user_attr('run_id', child_run.info.run_id)
+        
+        return acc
+    
+with mlflow.start_run(run_name='study') as run:
+    n_trials = PARAMS['optuna_trials']
     mlflow.log_params(PARAMS)
     
-    full_pipe.fit(x_train, y_train)
-    predictions = full_pipe.predict(x_test)
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
     
-    f1 = metrics.f1_score(y_test, predictions)
-    acc = metrics.accuracy_score(y_test, predictions)
-    
-    print(f'F1 = {f1}\nAcc = {acc}')
-    
-    mlflow.log_metric("f1", f1)
-    mlflow.log_metric("accuracy", acc)
-
-    mlflow.sklearn.log_model(
-        full_pipe,
-        name='VT_SKB_LR',
-        input_example=x_train.iloc[:5],
-        skops_trusted_types=["numpy.dtype", "sklearn.feature_selection._univariate_selection.f_classif"],
-    )
-
-    selected_gex = preprocess_features.named_transformers_['gex_selection'].get_feature_names_out()
-    mlflow.log_text("\n".join(selected_gex), "selected_genes.txt")
+    # Log the best trial and its run ID
+    mlflow.log_params(study.best_trial.params)
+    mlflow.log_metrics({
+        'best_error': study.best_value
+    })
+    if best_run_id := study.best_trial.user_attrs.get('run_id'):
+        mlflow.log_param('best_child_run_id', best_run_id)
