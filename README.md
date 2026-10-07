@@ -29,8 +29,8 @@ A reference MLOps pipeline that takes a ML model from versioned code and data al
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
-cd <your-repo>
+git clone https://github.com/dinhhb/MLOps.git
+cd MLOps
 
 # Create a virtual environment and install dependencies
 python -m venv .venv
